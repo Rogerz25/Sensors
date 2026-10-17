@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+Live GSR/EDA stress monitor for an Odax sensor on an Arduino Nano ESP32.
+
+  pip install pyserial numpy matplotlib
+
+  python gsr_stress_monitor.py                 # auto-detect serial port
+  python gsr_stress_monitor.py --port COM5     # or /dev/ttyACM0, /dev/cu.usbmodem*
+  python gsr_stress_monitor.py --demo          # simulated data, no hardware
+
+How it works
+  1. Calibration: sit relaxed for --baseline seconds (default 60). The mean/spread of the
+     signal in that period becomes your personal resting baseline.
+  2. Tonic level  = slow moving average (--tonic-s) of the signal   -> overall arousal
+     Phasic part  = fast-smoothed signal minus tonic                -> skin conductance responses (SCRs)
+  3. Stress score (0-100) = 60% how far the tonic level is above your baseline
+                            (full scale = --tonic-range x baseline, default 5%)
+                          + 40% SCR rate over the last minute.
+     < 33 LOW   33-66 MODERATE   > 66 HIGH
+  Close the plot window (or Ctrl+C) to save <prefix>.csv and <prefix>.png.
+
+NOTE: the score is a relative arousal index for you, in this session, with these electrodes.
+It is not a clinical measure. Values are in millivolts of sensor output; check Odax's
+datasheet if you need to convert to microsiemens.
+"""
+import argparse
+import csv
+import sys
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+
+
+# --------------------------------------------------------------------------- data sources
+class SerialSource:
+    def __init__(self, port, baud):
+        if serial is None:
+            sys.exit("pyserial missing: pip install pyserial")
+        port = port or self.autodetect()
+        print(f"Opening {port} @ {baud}")
+        self.ser = serial.Serial(port, baud, timeout=0.05)
+        time.sleep(2.0)            # ESP32 may reset when the port opens
+        self.ser.reset_input_buffer()
+
+    @staticmethod
+    def autodetect():
+        ports = list(list_ports.comports())
+        if not ports:
+            sys.exit("No serial ports found. Plug in the board or pass --port.")
+        for p in ports:
+            desc = f"{p.description} {p.manufacturer}".lower()
+            if p.vid == 0x2341 or "arduino" in desc or "usb" in desc or "esp" in desc:
+                return p.device
+        return ports[0].device
+
+    def poll(self):
+        out = []
+        while self.ser.in_waiting:
+            line = self.ser.readline().decode("utf-8", "ignore").strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) != 3:
+                continue
+            try:
+                out.append((int(parts[0]) / 1000.0, float(parts[2])))
+            except ValueError:
+                pass
+        return out
+
+    def close(self):
+        self.ser.close()
+
+
+class DemoSource:
+    """Synthetic signal: calm for ~90 s, then rising arousal with more SCRs."""
+    def __init__(self, fs=20.0):
+        self.fs, self.n, self.t0 = fs, 0, time.time()
+        rng = np.random.default_rng(1)
+        self.rng = rng
+        ev, t = [], 5.0
+        while t < 3600:
+            ev.append((t, rng.uniform(10, 35)))
+            t += rng.exponential(20.0 if t < 90 else 5.0)
+        self.events = np.array(ev)
+
+    def _value(self, t):
+        v = 1500 + 15 * np.sin(t / 40) + (60 * (1 - np.exp(-(t - 90) / 60)) if t > 90 else 0)
+        dt = t - self.events[:, 0]
+        m = (dt > 0) & (dt < 30)
+        x = dt[m]
+        v += np.sum(self.events[m, 1] * (1 - np.exp(-x / 0.7)) * np.exp(-x / 5.0))
+        return v + self.rng.normal(0, 1.5)
+
+    def poll(self):
+        target = int((time.time() - self.t0) * self.fs)
+        out = []
+        while self.n < target:
+            t = self.n / self.fs
+            out.append((t, self._value(t)))
+            self.n += 1
+        return out
+
+    def close(self):
+        pass
+
+
+# --------------------------------------------------------------------------- signal processing
+def trailing_mean(x, n):
+    n = max(1, min(int(n), len(x)))
+    c = np.cumsum(np.insert(x, 0, 0.0))
+    out = np.empty(len(x))
+    out[n - 1:] = (c[n:] - c[:-n]) / n
+    for i in range(n - 1):
+        out[i] = c[i + 1] / (i + 1)
+    return out
+
+
+def compute(t, v, base, t_cal_end, a):
+    """Return dict of smooth, tonic, phasic, peak indices, scr rate/min, and stress score."""
+    fs = 1.0 / np.median(np.diff(t)) if len(t) > 2 else a.fs
+    smooth = trailing_mean(v, round(a.smooth_s * fs))
+    tonic = trailing_mean(v, round(a.tonic_s * fs))
+    phasic = smooth - tonic
+
+    mid = phasic[1:-1]
+    cand = np.where((mid > phasic[:-2]) & (mid >= phasic[2:]) & (mid > a.scr_thresh))[0] + 1
+    peaks = []
+    for i in cand:
+        if peaks and t[i] - t[peaks[-1]] < a.min_gap:
+            if phasic[i] > phasic[peaks[-1]]:
+                peaks[-1] = i
+        else:
+            peaks.append(i)
+    peaks = np.array(peaks, dtype=int)
+
+    pt = t[peaks]
+    count = np.searchsorted(pt, t, "right") - np.searchsorted(pt, t - 60, "right")
+    elapsed = np.clip(t - t[0], 1e-9, 60)
+    rate = np.where(t - t[0] > 10, count * 60.0 / elapsed, 0.0)
+
+    score = np.full(len(t), np.nan)
+    if base is not None:
+        mu, sd = base
+        span = max(3 * sd, a.tonic_range * mu)   # rise (mV) that counts as maximal tonic arousal
+        tonic_c = np.clip((tonic - mu) / span, 0, 1)
+        scr_c = np.clip(rate / a.scr_high, 0, 1)
+        score = 100 * (0.6 * tonic_c + 0.4 * scr_c)
+        score[t < t_cal_end] = np.nan
+    return dict(smooth=smooth, tonic=tonic, phasic=phasic, peaks=peaks, rate=rate, score=score)
+
+
+def level(s):
+    return "LOW" if s < 33 else "MODERATE" if s < 66 else "HIGH"
+
+
+LEVEL_COLORS = {"LOW": "#2e9e5b", "MODERATE": "#e0a100", "HIGH": "#d64541"}
+
+
+def draw_axes(ax_sig, ax_score):
+    ax_sig.set_ylabel("Sensor output (mV)")
+    ax_sig.grid(alpha=0.3)
+    ax_score.set_ylabel("Stress score")
+    ax_score.set_xlabel("Time (s)")
+    ax_score.set_ylim(0, 100)
+    ax_score.axhspan(0, 33, color=LEVEL_COLORS["LOW"], alpha=0.12)
+    ax_score.axhspan(33, 66, color=LEVEL_COLORS["MODERATE"], alpha=0.12)
+    ax_score.axhspan(66, 100, color=LEVEL_COLORS["HIGH"], alpha=0.12)
+    ax_score.grid(alpha=0.3)
+
+
+# --------------------------------------------------------------------------- main
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--port")
+    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--demo", action="store_true", help="simulated data, no hardware")
+    p.add_argument("--baseline", type=float, default=60, help="calibration seconds (stay relaxed)")
+    p.add_argument("--window", type=float, default=120, help="seconds shown in live plot")
+    p.add_argument("--invert", action="store_true", help="flip signal if your output falls with arousal")
+    p.add_argument("--smooth-s", type=float, default=1.0)
+    p.add_argument("--tonic-s", type=float, default=10.0)
+    p.add_argument("--scr-thresh", type=float, default=4.0, help="min SCR amplitude in mV")
+    p.add_argument("--min-gap", type=float, default=1.5, help="min seconds between SCRs")
+    p.add_argument("--scr-high", type=float, default=10.0, help="SCRs/min treated as maximal")
+    p.add_argument("--tonic-range", type=float, default=0.05,
+                   help="tonic rise, as a fraction of baseline, that counts as maximal (default 0.05 = 5%%)")
+    p.add_argument("--min-sd", type=float, default=2.0, help="floor on baseline SD (mV)")
+    p.add_argument("--fs", type=float, default=20.0)
+    p.add_argument("--prefix", default=time.strftime("gsr_session_%Y%m%d_%H%M%S"))
+    return p.parse_args()
+
+
+def save_report(T, V, state, a):
+    if len(T) < 50:
+        print("Not enough data to save.")
+        return
+    t, v = np.array(T), np.array(V)
+    res = compute(t, v, state["base"], state["t_cal_end"], a)
+    t_rel = t - t[0]
+
+    with open(a.prefix + ".csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", "mV", "smooth_mV", "tonic_mV", "phasic_mV", "scr_per_min", "stress_score"])
+        for row in zip(t_rel, v, res["smooth"], res["tonic"], res["phasic"], res["rate"], res["score"]):
+            w.writerow([f"{x:.4f}" if not np.isnan(x) else "" for x in row])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [3, 2]})
+    ax1.plot(t_rel, v, color="0.75", lw=0.6, label="raw")
+    ax1.plot(t_rel, res["smooth"], color="tab:blue", lw=1.2, label="smoothed")
+    ax1.plot(t_rel, res["tonic"], color="tab:orange", lw=1.8, label="tonic")
+    ax1.plot(t_rel[res["peaks"]], res["smooth"][res["peaks"]], "v", color="tab:red", label="SCR")
+    if state["base"]:
+        ax1.axhline(state["base"][0], color="k", ls="--", lw=0.8, label="baseline")
+        ax1.axvspan(0, state["t_cal_end"] - t[0], color="0.5", alpha=0.15, label="calibration")
+    ax1.legend(loc="upper left", ncol=3, fontsize=8)
+    draw_axes(ax1, ax2)
+    ax2.plot(t_rel, res["score"], color="k", lw=1.5)
+    valid = res["score"][~np.isnan(res["score"])]
+    title = "GSR / EDA session"
+    if len(valid):
+        title += f"  |  mean score {valid.mean():.0f}, peak {valid.max():.0f}, SCRs {len(res['peaks'])}"
+    ax1.set_title(title)
+    fig.tight_layout()
+    fig.savefig(a.prefix + ".png", dpi=150)
+    plt.close(fig)
+    print(f"Saved {a.prefix}.csv and {a.prefix}.png")
+
+
+def main():
+    a = parse_args()
+    src = DemoSource(a.fs) if a.demo else SerialSource(a.port, a.baud)
+    T, V = [], []
+    state = {"base": None, "t_cal_end": np.inf}
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True,
+                                   gridspec_kw={"height_ratios": [3, 2]})
+    draw_axes(ax1, ax2)
+    l_raw, = ax1.plot([], [], color="0.75", lw=0.6, label="raw")
+    l_smooth, = ax1.plot([], [], color="tab:blue", lw=1.2, label="smoothed")
+    l_tonic, = ax1.plot([], [], color="tab:orange", lw=1.8, label="tonic")
+    l_scr, = ax1.plot([], [], "v", color="tab:red", label="SCR")
+    l_score, = ax2.plot([], [], color="k", lw=1.5)
+    ax1.legend(loc="upper left", ncol=4, fontsize=8)
+    status = ax2.text(0.99, 0.93, "", transform=ax2.transAxes, ha="right", va="top",
+                      fontsize=14, fontweight="bold")
+    title = ax1.set_title("Waiting for data...")
+
+    def update(_):
+        for ts, mv in src.poll():
+            T.append(ts)
+            V.append(3300.0 - mv if a.invert else mv)
+        if len(T) < 30:
+            return
+        t_all = np.array(T)
+
+        if state["base"] is None and t_all[-1] - t_all[0] >= a.baseline:
+            t, v = t_all, np.array(V)
+            sm = trailing_mean(v, round(a.smooth_s * a.fs))
+            m = (t - t[0] >= 5) & (t - t[0] <= a.baseline)
+            state["base"] = (float(sm[m].mean()), max(float(sm[m].std()), a.min_sd))
+            state["t_cal_end"] = t[0] + a.baseline
+            print(f"Baseline: {state['base'][0]:.1f} mV (SD {state['base'][1]:.1f})")
+
+        keep = t_all >= t_all[-1] - 600          # live analysis on the last 10 min
+        t, v = t_all[keep], np.array(V)[keep]
+        res = compute(t, v, state["base"], state["t_cal_end"], a)
+        tr = t - T[0]
+        show = tr >= tr[-1] - a.window
+
+        l_raw.set_data(tr[show], v[show])
+        l_smooth.set_data(tr[show], res["smooth"][show])
+        l_tonic.set_data(tr[show], res["tonic"][show])
+        pk = res["peaks"][show[res["peaks"]]]
+        l_scr.set_data(tr[pk], res["smooth"][pk])
+        l_score.set_data(tr[show], res["score"][show])
+        ax1.set_xlim(max(0, tr[-1] - a.window), max(a.window, tr[-1]))
+        lo, hi = v[show].min(), v[show].max()
+        pad = max(5.0, 0.1 * (hi - lo))
+        ax1.set_ylim(lo - pad, hi + pad)
+
+        if state["base"] is None:
+            left = a.baseline - (t_all[-1] - t_all[0])
+            status.set_text(f"Calibrating... stay relaxed ({left:.0f}s)")
+            status.set_color("0.3")
+        else:
+            s = res["score"][-1]
+            lv = level(s)
+            status.set_text(f"{s:.0f}  {lv}")
+            status.set_color(LEVEL_COLORS[lv])
+        title.set_text(f"GSR live  |  {res['rate'][-1]:.1f} SCR/min  |  {len(t_all)} samples")
+
+    anim = FuncAnimation(fig, update, interval=200, cache_frame_data=False)  # noqa: F841
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        src.close()
+        save_report(T, V, state, a)
+
+
+if __name__ == "__main__":
+    main()
