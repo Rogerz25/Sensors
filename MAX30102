@@ -1,0 +1,129 @@
+/*
+  Heart Rate (PBA Algorithm, unmodified) + SpO2 + Temperature
+  using the MAX30105 Breakout.
+
+  Heart rate detection logic is identical to SparkFun's original example —
+  only the sample-fetching method was changed (to avoid double-consuming
+  the sensor's FIFO), and SpO2 + temperature were added.
+
+  Serial output is throttled to once per second so downstream logging
+  (e.g. the Python script) gets one clean reading per second.
+
+  Open Tools > Serial Plotter to graph BPM, SpO2, and Temperature live.
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+
+MAX30105 particleSensor;
+
+// --- Heart rate (PBA) - same as original ---
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg;
+
+// --- SpO2 buffers ---
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+byte bufferIndex = 0;
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRateAlgo; // required by the algorithm call, unused for plotting
+int8_t validHeartRate;
+
+// --- Temperature ---
+float temperature = 0;
+unsigned long lastTempUpdate = 0;
+
+// --- Serial output throttle ---
+unsigned long lastPrintTime = 0;
+const unsigned long PRINT_INTERVAL = 1000; // 1000 ms = 1 second
+
+void setup()
+{
+  Serial.begin(115200);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST))
+  {
+    Serial.println("MAX30105 was not found. Please check wiring/power.");
+    while (1);
+  }
+
+  particleSensor.setup();                    // default settings
+  particleSensor.setPulseAmplitudeRed(0x1F);  // Red needed for SpO2
+  particleSensor.setPulseAmplitudeIR(0x1F);   // IR needed for HR + SpO2
+  particleSensor.setPulseAmplitudeGreen(0);   // not used
+}
+
+void loop()
+{
+  particleSensor.check(); // pulls any new samples into the FIFO
+
+  while (particleSensor.available())
+  {
+    long irValue  = particleSensor.getFIFOIR();
+    long redValue = particleSensor.getFIFORed();
+
+    // ---- Original heart rate detection, unchanged ----
+    if (checkForBeat(irValue) == true)
+    {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20)
+      {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++)
+          beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+
+    // ---- Feed the same sample into the SpO2 rolling buffer ----
+    irBuffer[bufferIndex] = irValue;
+    redBuffer[bufferIndex] = redValue;
+    bufferIndex++;
+
+    if (bufferIndex == BUFFER_SIZE)
+    {
+      maxim_heart_rate_and_oxygen_saturation(
+        irBuffer, BUFFER_SIZE, redBuffer,
+        &spo2, &validSPO2, &heartRateAlgo, &validHeartRate
+      );
+      bufferIndex = 0; // refill buffer from scratch for the next window
+    }
+
+    particleSensor.nextSample(); // advance FIFO pointer (single consumption point)
+  }
+
+  // ---- Temperature: only needs occasional updates, it's a slow read ----
+  if (millis() - lastTempUpdate > 1000)
+  {
+    lastTempUpdate = millis();
+    temperature = particleSensor.readTemperature();
+  }
+
+  // ---- Serial output: once per second, label:value pairs, comma separated ----
+  if (millis() - lastPrintTime >= PRINT_INTERVAL)
+  {
+    lastPrintTime = millis();
+
+    Serial.print("BPM:");
+    Serial.print(beatAvg);
+    Serial.print(",SpO2:");
+    Serial.print(validSPO2 ? spo2 : 0);
+    Serial.print(",Temperature:");
+    Serial.println(temperature);
+  }
+}
